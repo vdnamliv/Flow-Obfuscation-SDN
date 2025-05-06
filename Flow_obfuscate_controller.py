@@ -12,6 +12,9 @@ log = core.getLogger()
 IDLE_TIMEOUT = 300
 HARD_TIMEOUT = 600
 
+# Biến toàn cục để lưu obfuscate_path
+_obfuscate_path = 3  # Giá trị mặc định
+
 def subnet(ip):
     """Extract the subnet (first 3 octets) from an IP address."""
     parts = str(ip).split('.')
@@ -29,7 +32,7 @@ def is_allowed_access(src_ip, dst_ip):
 
 class FlowObfuscateSwitch(object):
     # Class variables for flow mapping and subnet-to-switch mapping
-    flow_mapping = {}  # {flow_id: (real_src_ip, [virtual_ip1, virtual_ip2])}
+    flow_mapping = {}  # {flow_id: (real_src_ip, [virtual_ips])}
     next_flow_id = 1
     subnet_to_switch = {
         "10.0.0": 1,  # s1
@@ -46,6 +49,39 @@ class FlowObfuscateSwitch(object):
         IPAddr("10.0.3.254"): EthAddr("00:00:00:00:00:04"),
         IPAddr("10.0.4.254"): EthAddr("00:00:00:00:00:05"),
         IPAddr("10.0.5.254"): EthAddr("00:00:00:00:00:06"),
+    }
+    # Routing table: (src_switch, dst_switch) -> [path of switches]
+    routing_table = {
+        (1, 2): [1, 7, 8, 9, 10, 11, 12, 13, 2],  # h1 -> s1 -> s7 -> s8 -> s9 -> s10 -> s11 -> s12 -> s13 -> s2 -> h6
+        (1, 3): [1, 7, 8, 9, 10, 11, 12, 13, 2, 3],
+        (1, 4): [1, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4],
+        (1, 5): [1, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4, 5],
+        (1, 6): [1, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4, 5, 6],
+        (2, 1): [2, 13, 12, 11, 10, 9, 8, 7, 1],  # h6 -> s2 -> s13 -> s12 -> s11 -> s10 -> s9 -> s8 -> s7 -> s1 -> h1
+        (2, 3): [2, 3],
+        (2, 4): [2, 3, 4],
+        (2, 5): [2, 3, 4, 5],
+        (2, 6): [2, 3, 4, 5, 6],
+        (3, 1): [3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
+        (3, 2): [3, 2],
+        (3, 4): [3, 4],
+        (3, 5): [3, 4, 5],
+        (3, 6): [3, 4, 5, 6],
+        (4, 1): [4, 3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
+        (4, 2): [4, 3, 2],
+        (4, 3): [4, 3],
+        (4, 5): [4, 5],
+        (4, 6): [4, 5, 6],
+        (5, 1): [5, 4, 3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
+        (5, 2): [5, 4, 3, 2],
+        (5, 3): [5, 4, 3],
+        (5, 4): [5, 4],
+        (5, 6): [5, 6],
+        (6, 1): [6, 5, 4, 3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
+        (6, 2): [6, 5, 4, 3, 2],
+        (6, 3): [6, 5, 4, 3],
+        (6, 4): [6, 5, 4],
+        (6, 5): [6, 5],
     }
 
     def __init__(self, connection):
@@ -75,6 +111,43 @@ class FlowObfuscateSwitch(object):
         self.connection.send(msg_default)
         log.debug("[Debug] Installed default rule on switch dpid=%s: send all packets to controller", self.connection.dpid)
 
+    def _get_path(self, src_switch, dst_switch):
+        """Get the path (list of switches) from src_switch to dst_switch."""
+        return self.routing_table.get((src_switch, dst_switch), [])
+
+    def _get_outport(self, current_switch, next_switch):
+        """Determine the output port to reach the next switch."""
+        if current_switch == next_switch:
+            return None
+        if current_switch == 1: return 1  # s1 -> s7
+        if current_switch == 7: return 2 if next_switch == 8 else 1  # s7 -> s8
+        if current_switch == 8: return 2 if next_switch == 9 else 1  # s8 -> s9
+        if current_switch == 9: return 2 if next_switch == 10 else 1  # s9 -> s10
+        if current_switch == 10: return 2 if next_switch == 11 else 1  # s10 -> s11
+        if current_switch == 11: return 2 if next_switch == 12 else 1  # s11 -> s12
+        if current_switch == 12: return 2 if next_switch == 13 else 1  # s12 -> s13
+        if current_switch == 13: return 2 if next_switch == 2 else 1  # s13 -> s2
+        if current_switch == 2:
+            if next_switch == 13: return 1  # s2 -> s13
+            if next_switch == 3: return 2   # s2 -> s3
+            return 3  # s2 -> hosts
+        if current_switch == 3:
+            if next_switch == 2: return 1   # s3 -> s2
+            if next_switch == 4: return 2   # s3 -> s4
+            return 3  # s3 -> hosts
+        if current_switch == 4:
+            if next_switch == 3: return 1   # s4 -> s3
+            if next_switch == 5: return 2   # s4 -> s5
+            return 3  # s4 -> hosts
+        if current_switch == 5:
+            if next_switch == 4: return 1   # s5 -> s4
+            if next_switch == 6: return 2   # s5 -> s6
+            return 3  # s5 -> hosts
+        if current_switch == 6:
+            if next_switch == 5: return 1   # s6 -> s5
+            return 2  # s6 -> hosts
+        return None
+
     def _handle_PacketIn(self, event):
         """Handle incoming packets from the switch."""
         packet = event.parsed
@@ -100,82 +173,101 @@ class FlowObfuscateSwitch(object):
 
             if src_subnet == dst_subnet:
                 self._forward_within_subnet(event, packet, ipp, switch_dpid, inport)
-            elif switch_dpid == 1:
-                self._handle_s1(event, packet, ipp, inport)
-            elif switch_dpid == 7:
-                self._handle_s7(event, packet, ipp, inport)
-            elif switch_dpid == 8:
-                self._handle_s8(event, packet, ipp, inport)
             else:
-                self._forward_to_destination(event, packet, ipp, switch_dpid, inport)
+                self._handle_obfuscation(event, packet, ipp, switch_dpid, inport)
 
-            # Handle ICMP reply packets that don't match existing flow rules
-            icmp_packet = packet.find('icmp')
-            if icmp_packet and icmp_packet.type == 0:  # ICMP Echo Reply
-                log.debug("[Debug] Switch dpid=%s: Received ICMP Echo Reply from %s to %s on port %s", 
-                          switch_dpid, ipp.srcip, ipp.dstip, inport)
-                if switch_dpid == 8 and inport == 2:  # From s2 to s8
-                    flow_id = int(str(ipp.dstip).split('.')[-1]) if str(ipp.dstip).startswith("10.0.0") else None
-                    if flow_id and flow_id in FlowObfuscateSwitch.flow_mapping:
-                        real_src_ip, virtual_ips = FlowObfuscateSwitch.flow_mapping[flow_id]
-                        virtual_ip2 = virtual_ips[1]
-                        fm = of.ofp_flow_mod()
-                        fm.match = of.ofp_match()
-                        fm.match.dl_type = ethernet.IP_TYPE
-                        fm.match.nw_proto = ipp.protocol
-                        fm.match.nw_src = ipp.srcip
-                        fm.match.in_port = inport
-                        fm.match.icmp_type = 0
-                        fm.match.icmp_code = 0
-                        fm.actions.append(of.ofp_action_nw_addr.set_dst(virtual_ip2))
-                        fm.actions.append(of.ofp_action_output(port=1))
-                        fm.idle_timeout = IDLE_TIMEOUT
-                        fm.hard_timeout = HARD_TIMEOUT
-                        fm.priority = 65535
-                        fm.data = event.ofp
-                        self.connection.send(fm)
-                        log.debug("[Debug] Switch dpid=8: Installed ad-hoc flow rule for ICMP reply from %s to %s via port 1", ipp.srcip, virtual_ip2)
-                elif switch_dpid == 7 and inport == 2:  # From s8 to s7
-                    flow_id = int(str(ipp.dstip).split('.')[-1])
-                    if flow_id in FlowObfuscateSwitch.flow_mapping:
-                        real_src_ip, virtual_ips = FlowObfuscateSwitch.flow_mapping[flow_id]
-                        virtual_ip1 = virtual_ips[0]
-                        fm = of.ofp_flow_mod()
-                        fm.match = of.ofp_match()
-                        fm.match.dl_type = ethernet.IP_TYPE
-                        fm.match.nw_proto = ipp.protocol
-                        fm.match.nw_src = ipp.srcip
-                        fm.match.in_port = inport
-                        fm.match.icmp_type = 0
-                        fm.match.icmp_code = 0
-                        fm.actions.append(of.ofp_action_nw_addr.set_dst(virtual_ip1))
-                        fm.actions.append(of.ofp_action_output(port=1))
-                        fm.idle_timeout = IDLE_TIMEOUT
-                        fm.hard_timeout = HARD_TIMEOUT
-                        fm.priority = 65535
-                        fm.data = event.ofp
-                        self.connection.send(fm)
-                        log.debug("[Debug] Switch dpid=7: Installed ad-hoc flow rule for ICMP reply from %s to %s via port 1", ipp.srcip, virtual_ip1)
-                elif switch_dpid == 1 and inport == 1:  # From s7 to s1
-                    flow_id = int(str(ipp.dstip).split('.')[-1])
-                    if flow_id in FlowObfuscateSwitch.flow_mapping:
-                        real_src_ip, virtual_ips = FlowObfuscateSwitch.flow_mapping[flow_id]
-                        fm = of.ofp_flow_mod()
-                        fm.match = of.ofp_match()
-                        fm.match.dl_type = ethernet.IP_TYPE
-                        fm.match.nw_proto = ipp.protocol
-                        fm.match.nw_src = ipp.srcip
-                        fm.match.in_port = inport
-                        fm.match.icmp_type = 0
-                        fm.match.icmp_code = 0
-                        fm.actions.append(of.ofp_action_nw_addr.set_dst(real_src_ip))
-                        fm.actions.append(of.ofp_action_output(port=2))
-                        fm.idle_timeout = IDLE_TIMEOUT
-                        fm.hard_timeout = HARD_TIMEOUT
-                        fm.priority = 65535
-                        fm.data = event.ofp
-                        self.connection.send(fm)
-                        log.debug("[Debug] Switch dpid=1: Installed ad-hoc flow rule for ICMP reply from %s to %s via port 2", ipp.srcip, real_src_ip)
+    def _handle_obfuscation(self, event, packet, ipp, switch_dpid, inport):
+        """Handle packet obfuscation along the path based on obfuscate_path."""
+        # Handle flow mapping first to determine real_src_ip
+        flow_id = int(str(ipp.srcip).split('.')[-1]) if str(ipp.srcip).startswith("10.0.") else None
+        if flow_id is None or flow_id not in self.flow_mapping:
+            if switch_dpid == 1:  # First switch in the path (s1)
+                flow_id = self.next_flow_id
+                self.flow_mapping[flow_id] = (ipp.srcip, [])
+                self.next_flow_id += 1
+            else:
+                log.debug("[Debug] Switch dpid=%s: Flow ID %s not in flow_mapping, dropping packet from %s to %s", switch_dpid, flow_id, ipp.srcip, ipp.dstip)
+                return
+
+        real_src_ip, virtual_ips = self.flow_mapping[flow_id]
+        src_subnet = subnet(real_src_ip)  # Use real_src_ip to determine source subnet
+        dst_subnet = subnet(ipp.dstip)
+        src_switch = self.subnet_to_switch.get(src_subnet)
+        dst_switch = self.subnet_to_switch.get(dst_subnet)
+        if not src_switch or not dst_switch:
+            log.debug("[Debug] Switch dpid=%s: Cannot determine src/dst switch for %s -> %s (real src: %s)", switch_dpid, ipp.srcip, ipp.dstip, real_src_ip)
+            return
+
+        # Get the path from src_switch to dst_switch
+        path = self._get_path(src_switch, dst_switch)
+        if not path or switch_dpid not in path:
+            log.debug("[Debug] Switch dpid=%s: No path found or switch not in path for %s -> %s", switch_dpid, ipp.srcip, ipp.dstip)
+            return
+
+        # Find the position of the current switch in the path
+        current_pos = path.index(switch_dpid)
+
+        # Determine if we should obfuscate at this switch
+        if current_pos < _obfuscate_path and current_pos < len(path) - 1:
+            # Obfuscate: change source IP
+            new_virtual_ip = IPAddr("10.0.{}.{}".format(99 - current_pos, flow_id))
+            virtual_ips.append(new_virtual_ip)
+            self.flow_mapping[flow_id] = (real_src_ip, virtual_ips)
+            log.debug("[Debug] Switch dpid=%s: Obfuscating source IP from %s to %s", switch_dpid, ipp.srcip, new_virtual_ip)
+        else:
+            new_virtual_ip = ipp.srcip  # No change if we've exceeded obfuscate_path
+
+        # Check access rules at the last obfuscation point
+        if current_pos == min(_obfuscate_path, len(path) - 2):
+            if not is_allowed_access(real_src_ip, ipp.dstip):
+                log.debug("[Debug] Switch dpid=%s: Access denied for packet from %s to %s", switch_dpid, real_src_ip, ipp.dstip)
+                fm = of.ofp_flow_mod()
+                fm.match = of.ofp_match.from_packet(packet, inport)
+                fm.priority = 25
+                self.connection.send(fm)
+                return
+
+        # Forward to the next switch
+        next_switch = path[current_pos + 1] if current_pos < len(path) - 1 else None
+        if next_switch:
+            outport = self._get_outport(switch_dpid, next_switch)
+            if not outport:
+                log.debug("[Debug] Switch dpid=%s: No outport found to reach switch %s", switch_dpid, next_switch)
+                return
+
+            # Forward rule
+            fm = of.ofp_flow_mod()
+            fm.match = of.ofp_match.from_packet(packet, inport)
+            if new_virtual_ip != ipp.srcip:
+                fm.actions.append(of.ofp_action_nw_addr.set_src(new_virtual_ip))
+            fm.actions.append(of.ofp_action_output(port=outport))
+            fm.idle_timeout = IDLE_TIMEOUT
+            fm.hard_timeout = HARD_TIMEOUT
+            fm.priority = 65535
+            fm.data = event.ofp
+            self.connection.send(fm)
+            log.debug("[Debug] Switch dpid=%s: Installed flow rule to forward ICMP from %s to %s via port %s, new src IP=%s", switch_dpid, ipp.srcip, ipp.dstip, outport, new_virtual_ip)
+
+            # Return rule
+            fm_back = of.ofp_flow_mod()
+            fm_back.match = of.ofp_match()
+            fm_back.match.dl_type = ethernet.IP_TYPE
+            fm_back.match.nw_proto = ipp.protocol
+            fm_back.match.nw_src = ipp.dstip
+            fm_back.match.in_port = outport
+            fm_back.match.icmp_type = 0
+            fm_back.match.icmp_code = 0
+            prev_virtual_ip = virtual_ips[-1] if virtual_ips else real_src_ip
+            fm_back.actions.append(of.ofp_action_nw_addr.set_dst(prev_virtual_ip))
+            fm_back.actions.append(of.ofp_action_output(port=inport))
+            fm_back.idle_timeout = IDLE_TIMEOUT
+            fm_back.hard_timeout = HARD_TIMEOUT
+            fm_back.priority = 65535
+            self.connection.send(fm_back)
+            log.debug("[Debug] Switch dpid=%s: Installed return flow rule for ICMP from %s to %s via port %s", switch_dpid, ipp.dstip, prev_virtual_ip, inport)
+        else:
+            # Last switch: forward to destination host
+            self._forward_to_destination(event, packet, ipp, switch_dpid, inport)  # Sửa lỗi đệ quy
 
     def _handle_arp(self, event, packet, switch_dpid, inport):
         """Handle ARP packets (requests and replies)."""
@@ -286,136 +378,6 @@ class FlowObfuscateSwitch(object):
                     fm.data = event.ofp
                     self.connection.send(fm)
 
-    def _handle_s1(self, event, packet, ipp, inport):
-        """Handle packets on switch s1: obfuscate source IP and forward to s7."""
-        flow_id = FlowObfuscateSwitch.next_flow_id
-        virtual_ip1 = IPAddr("10.0.99.{}".format(flow_id))
-        FlowObfuscateSwitch.flow_mapping[flow_id] = (ipp.srcip, [virtual_ip1])
-        FlowObfuscateSwitch.next_flow_id += 1
-
-        # Forward rule: change source IP to virtual_ip1 and send to s7
-        fm = of.ofp_flow_mod()
-        fm.match = of.ofp_match.from_packet(packet, inport)
-        fm.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip1))
-        fm.actions.append(of.ofp_action_output(port=1))
-        fm.idle_timeout = IDLE_TIMEOUT
-        fm.hard_timeout = HARD_TIMEOUT
-        fm.priority = 65535
-        fm.data = event.ofp
-        self.connection.send(fm)
-        log.debug("[Debug] Switch dpid=1: Installed flow rule to forward ICMP from %s to %s via s7 (port 1), new src IP=%s", ipp.srcip, ipp.dstip, virtual_ip1)
-
-        # Return rule: handle ICMP reply from dst to src
-        fm_back = of.ofp_flow_mod()
-        fm_back.match = of.ofp_match()
-        fm_back.match.dl_type = ethernet.IP_TYPE
-        fm_back.match.nw_proto = ipp.protocol  # Match ICMP
-        fm_back.match.nw_src = ipp.dstip  # Source IP of reply (e.g., 10.0.1.1)
-        fm_back.match.in_port = 1  # From s7 (s1-eth1)
-        fm_back.match.icmp_type = 0
-        fm_back.match.icmp_code = 0
-        fm_back.actions.append(of.ofp_action_nw_addr.set_dst(ipp.srcip))
-        fm_back.actions.append(of.ofp_action_output(port=inport))
-        fm_back.idle_timeout = IDLE_TIMEOUT
-        fm_back.hard_timeout = HARD_TIMEOUT
-        fm_back.priority = 65535
-        self.connection.send(fm_back)
-        log.debug("[Debug] Switch dpid=1: Installed return flow rule for ICMP from %s to %s via port %s", ipp.dstip, ipp.srcip, inport)
-
-    def _handle_s7(self, event, packet, ipp, inport):
-        """Handle packets on switch s7: further obfuscate source IP and forward to s8."""
-        flow_id = int(str(ipp.srcip).split('.')[-1])
-        if flow_id not in FlowObfuscateSwitch.flow_mapping:
-            log.debug("[Debug] Switch dpid=7: Flow ID %s not in flow_mapping, dropping packet from %s to %s", flow_id, ipp.srcip, ipp.dstip)
-            return
-
-        real_src_ip, virtual_ips = FlowObfuscateSwitch.flow_mapping[flow_id]
-        virtual_ip1 = virtual_ips[0]
-        virtual_ip2 = IPAddr("10.0.98.{}".format(flow_id))
-        FlowObfuscateSwitch.flow_mapping[flow_id] = (real_src_ip, [virtual_ip1, virtual_ip2])
-
-        # Forward rule: change source IP to virtual_ip2 and send to s8
-        fm = of.ofp_flow_mod()
-        fm.match = of.ofp_match.from_packet(packet, inport)
-        fm.actions.append(of.ofp_action_nw_addr.set_src(virtual_ip2))
-        fm.actions.append(of.ofp_action_output(port=2))
-        fm.idle_timeout = IDLE_TIMEOUT
-        fm.hard_timeout = HARD_TIMEOUT
-        fm.priority = 65535
-        fm.data = event.ofp
-        self.connection.send(fm)
-        log.debug("[Debug] Switch dpid=7: Installed flow rule to forward ICMP from %s to %s via s8 (port 2), new src IP=%s", ipp.srcip, ipp.dstip, virtual_ip2)
-
-        # Return rule: handle ICMP reply from dst to virtual_ip1
-        fm_back = of.ofp_flow_mod()
-        fm_back.match = of.ofp_match()
-        fm_back.match.dl_type = ethernet.IP_TYPE
-        fm_back.match.nw_proto = ipp.protocol  # Match ICMP
-        fm_back.match.nw_src = ipp.dstip  # Source IP of reply (e.g., 10.0.1.1)
-        fm_back.match.in_port = 2  # From s8 (s7-eth2)
-        fm_back.match.icmp_type = 0
-        fm_back.match.icmp_code = 0
-        fm_back.actions.append(of.ofp_action_nw_addr.set_dst(virtual_ip1))
-        fm_back.actions.append(of.ofp_action_output(port=1))
-        fm_back.idle_timeout = IDLE_TIMEOUT
-        fm_back.hard_timeout = HARD_TIMEOUT
-        fm_back.priority = 65535
-        self.connection.send(fm_back)
-        log.debug("[Debug] Switch dpid=7: Installed return flow rule for ICMP from %s to %s via port 1", ipp.dstip, virtual_ip1)
-
-    def _handle_s8(self, event, packet, ipp, inport):
-        """Handle packets on switch s8: check access, forward to s2."""
-        flow_id = int(str(ipp.srcip).split('.')[-1])
-        if flow_id not in FlowObfuscateSwitch.flow_mapping:
-            log.debug("[Debug] Switch dpid=8: Flow ID %s not in flow_mapping, dropping packet from %s to %s", flow_id, ipp.srcip, ipp.dstip)
-            return
-
-        real_src_ip, virtual_ips = FlowObfuscateSwitch.flow_mapping[flow_id]
-        virtual_ip2 = virtual_ips[1]
-
-        # Check if access is allowed between source and destination
-        if not is_allowed_access(real_src_ip, ipp.dstip):
-            log.debug("[Debug] Switch dpid=8: Access denied for packet from %s to %s", real_src_ip, ipp.dstip)
-            fm = of.ofp_flow_mod()
-            fm.match = of.ofp_match.from_packet(packet, inport)
-            fm.priority = 25
-            self.connection.send(fm)
-            return
-
-        dst_subnet = subnet(ipp.dstip)
-        dst_switch = FlowObfuscateSwitch.subnet_to_switch.get(dst_subnet)
-        if not dst_switch:
-            log.debug("[Debug] Switch dpid=8: No dst_switch found for subnet %s, dropping packet from %s to %s", dst_subnet, real_src_ip, ipp.dstip)
-            return
-
-        # Forward rule: send to s2 (port 2)
-        fm = of.ofp_flow_mod()
-        fm.match = of.ofp_match.from_packet(packet, inport)
-        fm.actions.append(of.ofp_action_output(port=2))
-        fm.idle_timeout = IDLE_TIMEOUT
-        fm.hard_timeout = HARD_TIMEOUT
-        fm.priority = 65535
-        fm.data = event.ofp
-        self.connection.send(fm)
-        log.debug("[Debug] Switch dpid=8: Installed flow rule to forward ICMP from %s to %s via s2 (port 2)", real_src_ip, ipp.dstip)
-
-        # Return rule: handle ICMP reply from dst to original src_ip (10.0.0.1)
-        fm_back = of.ofp_flow_mod()
-        fm_back.match = of.ofp_match()
-        fm_back.match.dl_type = ethernet.IP_TYPE
-        fm_back.match.nw_proto = ipp.protocol  # Match ICMP
-        fm_back.match.nw_src = ipp.dstip  # Source IP of reply (e.g., 10.0.1.1)
-        fm_back.match.in_port = 2  # From s2 (s8-eth2)
-        fm_back.match.icmp_type = 0
-        fm_back.match.icmp_code = 0
-        fm_back.actions.append(of.ofp_action_nw_addr.set_dst(virtual_ip2))
-        fm_back.actions.append(of.ofp_action_output(port=1))  # To s7 (s8-eth1)
-        fm_back.idle_timeout = IDLE_TIMEOUT
-        fm_back.hard_timeout = HARD_TIMEOUT
-        fm_back.priority = 65535
-        self.connection.send(fm_back)
-        log.debug("[Debug] Switch dpid=8: Installed return flow rule for ICMP from %s to %s via port 1 (s8-eth1)", ipp.dstip, real_src_ip)
-
     def _forward_within_subnet(self, event, packet, ipp, switch_dpid, inport):
         """Forward packets within the same subnet."""
         dst_mac = self.ip_to_mac.get(ipp.dstip)
@@ -437,92 +399,65 @@ class FlowObfuscateSwitch(object):
         self.connection.send(fm)
 
     def _forward_to_destination(self, event, packet, ipp, switch_dpid, inport):
-        """Forward packets to the destination switch or host."""
-        flow_id = int(str(ipp.srcip).split('.')[-1])
-        real_src_ip = FlowObfuscateSwitch.flow_mapping.get(flow_id, (None, None))[0] if flow_id in FlowObfuscateSwitch.flow_mapping else ipp.srcip
+        """Forward packets to the destination host."""
+        flow_id = int(str(ipp.srcip).split('.')[-1]) if str(ipp.srcip).startswith("10.0.") else None
+        real_src_ip = self.flow_mapping.get(flow_id, (ipp.srcip, []))[0] if flow_id in self.flow_mapping else ipp.srcip
 
         dst_subnet = subnet(ipp.dstip)
-        dst_switch = FlowObfuscateSwitch.subnet_to_switch.get(dst_subnet)
+        dst_switch = self.subnet_to_switch.get(dst_subnet)
         if not dst_switch:
             return
 
-        # If the packet is on the destination switch, forward to the host
-        if switch_dpid == dst_switch:
-            dst_mac = self.ip_to_mac.get(ipp.dstip)
-            if not dst_mac or dst_mac not in self.mac_table:
-                if ipp.dstip not in self.pending_packets:
-                    self.pending_packets[ipp.dstip] = []
-                self.pending_packets[ipp.dstip].append((event, packet, ipp, switch_dpid, inport))
-                log.debug("[Debug] Switch dpid=%s: Added packet to pending_packets, waiting for ARP reply for %s", 
-                          switch_dpid, ipp.dstip)
-                self._broadcast_arp_request(event, ipp.dstip, switch_dpid, inport)
-                return
-
-            out_dpid, outport = self.mac_table[dst_mac]
-            if out_dpid != switch_dpid or outport == inport:
-                return
-
-            # Forward rule: set real source IP and destination MAC, then output
-            fm = of.ofp_flow_mod()
-            fm.match = of.ofp_match.from_packet(packet, inport)
-            if real_src_ip and real_src_ip != ipp.srcip:
-                fm.actions.append(of.ofp_action_nw_addr.set_src(real_src_ip))
-            fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-            fm.actions.append(of.ofp_action_output(port=outport))
-            fm.idle_timeout = IDLE_TIMEOUT
-            fm.hard_timeout = HARD_TIMEOUT
-            fm.priority = 65535
-            fm.data = event.ofp
-            self.connection.send(fm)
-            log.debug("[Debug] Switch dpid=%s: Installed flow rule to forward ICMP directly to host %s (port %s), set dl_dst to %s", 
-                      switch_dpid, ipp.dstip, outport, dst_mac)
-
-            # Return rule: handle ICMP reply from dst to src
-            fm_back = of.ofp_flow_mod()
-            fm_back.match = of.ofp_match()
-            fm_back.match.dl_type = ethernet.IP_TYPE
-            fm_back.match.nw_proto = ipp.protocol  # Match ICMP
-            fm_back.match.nw_src = ipp.dstip
-            fm_back.match.nw_dst = real_src_ip if real_src_ip else ipp.srcip
-            fm_back.match.in_port = outport
-            fm_back.match.icmp_type = 0
-            fm_back.match.icmp_code = 0
-            fm_back.actions.append(of.ofp_action_output(port=inport))
-            fm_back.idle_timeout = IDLE_TIMEOUT
-            fm_back.hard_timeout = HARD_TIMEOUT
-            fm_back.priority = 65535
-            self.connection.send(fm_back)
-            log.debug("[Debug] Switch dpid=%s: Installed return flow rule for ICMP from %s to %s via port %s", 
-                      switch_dpid, ipp.dstip, real_src_ip if real_src_ip else ipp.srcip, inport)
+        if switch_dpid != dst_switch:
+            log.debug("[Debug] Switch dpid=%s: Not the destination switch (%s), should not reach here", switch_dpid, dst_switch)
             return
 
-        # Forward to the next switch
-        outport = self._get_outport(switch_dpid, dst_switch)
-        if not outport:
+        dst_mac = self.ip_to_mac.get(ipp.dstip)
+        if not dst_mac or dst_mac not in self.mac_table:
+            if ipp.dstip not in self.pending_packets:
+                self.pending_packets[ipp.dstip] = []
+            self.pending_packets[ipp.dstip].append((event, packet, ipp, switch_dpid, inport))
+            log.debug("[Debug] Switch dpid=%s: Added packet to pending_packets, waiting for ARP reply for %s", 
+                      switch_dpid, ipp.dstip)
+            self._broadcast_arp_request(event, ipp.dstip, switch_dpid, inport)
             return
 
+        out_dpid, outport = self.mac_table[dst_mac]
+        if out_dpid != switch_dpid or outport == inport:
+            return
+
+        # Forward rule
         fm = of.ofp_flow_mod()
         fm.match = of.ofp_match.from_packet(packet, inport)
         if real_src_ip and real_src_ip != ipp.srcip:
             fm.actions.append(of.ofp_action_nw_addr.set_src(real_src_ip))
+        fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
         fm.actions.append(of.ofp_action_output(port=outport))
         fm.idle_timeout = IDLE_TIMEOUT
         fm.hard_timeout = HARD_TIMEOUT
         fm.priority = 65535
         fm.data = event.ofp
         self.connection.send(fm)
+        log.debug("[Debug] Switch dpid=%s: Installed flow rule to forward ICMP directly to host %s (port %s), set dl_dst to %s", 
+                  switch_dpid, ipp.dstip, outport, dst_mac)
 
+        # Return rule
         fm_back = of.ofp_flow_mod()
         fm_back.match = of.ofp_match()
         fm_back.match.dl_type = ethernet.IP_TYPE
-        fm_back.match.nw_proto = ipp.protocol  # Match ICMP
+        fm_back.match.nw_proto = ipp.protocol
         fm_back.match.nw_src = ipp.dstip
         fm_back.match.nw_dst = real_src_ip if real_src_ip else ipp.srcip
+        fm_back.match.in_port = outport
+        fm_back.match.icmp_type = 0
+        fm_back.match.icmp_code = 0
         fm_back.actions.append(of.ofp_action_output(port=inport))
         fm_back.idle_timeout = IDLE_TIMEOUT
         fm_back.hard_timeout = HARD_TIMEOUT
         fm_back.priority = 65535
         self.connection.send(fm_back)
+        log.debug("[Debug] Switch dpid=%s: Installed return flow rule for ICMP from %s to %s via port %s", 
+                  switch_dpid, ipp.dstip, real_src_ip if real_src_ip else ipp.srcip, inport)
 
     def _broadcast_arp_request(self, event, target_ip, switch_dpid, inport):
         """Broadcast an ARP request to resolve the target IP."""
@@ -559,31 +494,18 @@ class FlowObfuscateSwitch(object):
 
         self.connection.send(msg)
 
-    def _get_outport(self, switch_dpid, dst_switch):
-        """Determine the output port to reach the destination switch."""
-        if switch_dpid == dst_switch:
-            return None
-        if switch_dpid == 1: return 1
-        if switch_dpid == 7: return 2
-        if switch_dpid == 8: return 2
-        if switch_dpid == 2:
-            if dst_switch == 1: return 1
-            return 2
-        if switch_dpid == 3:
-            if dst_switch in [1, 2]: return 1
-            return 2
-        if switch_dpid == 4:
-            if dst_switch in [1, 2, 3]: return 1
-            return 2
-        if switch_dpid == 5:
-            if dst_switch in [1, 2, 3, 4]: return 1
-            return 2
-        if switch_dpid == 6:
-            return 1
-        return None
-
-def launch():
+def launch(obfuscate_path="3"):
     """Start the controller and listen for switch connections."""
+    global _obfuscate_path
+    try:
+        _obfuscate_path = int(obfuscate_path)
+        if _obfuscate_path < 0:
+            raise ValueError("obfuscate_path must be non-negative")
+    except ValueError as e:
+        log.error("Invalid obfuscate_path value: %s. Using default value 3.", e)
+        _obfuscate_path = 3
+    log.info("[FlowObfuscate] Using obfuscate_path=%d", _obfuscate_path)
+
     def start_switch(event):
         FlowObfuscateSwitch(event.connection)
     core.openflow.addListenerByName("ConnectionUp", start_switch)
