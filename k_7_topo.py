@@ -1,6 +1,6 @@
 from mininet.topo import Topo
 
-class K3Topo(Topo):
+class K7Topo(Topo):
     def build(self):
         # Switches
         s1 = self.addSwitch('s1')  # Subnet 10.0.0.0/24 (h1-h5)
@@ -10,12 +10,22 @@ class K3Topo(Topo):
         s5 = self.addSwitch('s5')  # Subnet 10.0.4.0/24 (h21-h25)
         s6 = self.addSwitch('s6')  # Subnet 10.0.5.0/24 (h26-h30)
         s7 = self.addSwitch('s7')  # Obfuscation path
-        s8 = self.addSwitch('s8')  # Obfuscation path (sk)
+        s8 = self.addSwitch('s8')  # Obfuscation path
+        s9 = self.addSwitch('s9')  # Obfuscation path
+        s10 = self.addSwitch('s10')  # Obfuscation path
+        s11 = self.addSwitch('s11')  # Obfuscation path
+        s12 = self.addSwitch('s12')  # Obfuscation path
+        s13 = self.addSwitch('s13')  # Obfuscation path
 
         # Kết nối các switch
         self.addLink(s1, s7)
         self.addLink(s7, s8)
-        self.addLink(s8, s2)
+        self.addLink(s8, s9)
+        self.addLink(s9, s10)
+        self.addLink(s10, s11)
+        self.addLink(s11, s12)
+        self.addLink(s12, s13)
+        self.addLink(s13, s2)
         self.addLink(s2, s3)
         self.addLink(s3, s4)
         self.addLink(s4, s5)
@@ -41,4 +51,4 @@ class K3Topo(Topo):
             h = self.addHost(f'h{i}', ip=f'10.0.5.{i-25}/24', defaultRoute='via 10.0.5.254')
             self.addLink(h, s6)
 
-topos = { 'k3topo': (lambda: K3Topo()) }
+topos = { 'k7topo': (lambda: K7Topo()) }
