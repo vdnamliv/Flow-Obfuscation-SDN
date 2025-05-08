@@ -185,7 +185,9 @@ class FlowObfuscateSwitch (object):
         # ----- bước 1: đổi IP nếu trong k hop đầu --------------------
         if pos < k_max:
             new_ip = IPAddr("10.0.%d.%d" % (99-pos, flow_id))
-            virtual_list.append(new_ip)
+            if len(virtual_list) <= pos:               # <-- thêm điều kiện
+                virtual_list.append(new_ip)
+
             self.flow_mapping[flow_id] = (real_src, spine_path, virtual_list)
         else:
             new_ip = ipp.srcip
@@ -317,9 +319,12 @@ class FlowObfuscateSwitch (object):
             dst_subnet = subnet(arp_pkt.protodst)
             msg = of.ofp_packet_out(data=event.ofp, in_port=inport)
             if src_subnet == dst_subnet:
+                msg = of.ofp_packet_out(data = event.ofp, in_port = inport)
                 for pno in self.connection.ports:               # ✅ flood tất cả
-                    if pno != inport and pno != of.OFPP_LOCAL:
+                    if pno >= 8 and pno != inport:                 # chỉ cổng host
                         msg.actions.append(of.ofp_action_output(port = pno))
+                self.connection.send(msg)
+                return
             else:
                 dst_switch = self.subnet_to_switch.get(dst_subnet)
                 if dst_switch:
@@ -457,13 +462,16 @@ class FlowObfuscateSwitch (object):
 
         msg = of.ofp_packet_out()
         msg.data = eth.pack()
+        msg.in_port = of.OFPP_CONTROLLER 
 
         for pno in self.connection.ports:
-            if pno != inport and pno != of.OFPP_LOCAL:
+            if pno >= 8 and pno != inport:
                 msg.actions.append(of.ofp_action_output(port = pno))
-                log.debug("[ARP-REQ] dpid=%s → port %s (for %s)", switch_dpid, pno, target_ip)
 
         self.connection.send(msg)
+        log.debug("[ARP-REQ] dpid=%s → hosts ports %s for %s",
+                switch_dpid,
+                [a.port for a in msg.actions], target_ip)
 # -----------------------------------------------------------------------------
 def launch(obfuscate_path="3"):
     """pox.py flow_obf.py --obfuscate_path=3"""
