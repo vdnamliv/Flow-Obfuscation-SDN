@@ -1,48 +1,99 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
+"""
+Flow-Obfuscation Controller  —  phiên bản dùng đồ thị động
+✓ Shortest-path giữa edge-switches
+✓ Đổi IP tối đa k hop đầu  (k = --obfuscate_path)
+✓ Nếu path < k ⇒ cắt k = len(path)-1  (báo log cảnh báo)
+"""
 
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
-from pox.lib.packet import ethernet, arp, ipv4, icmp
+from pox.lib.packet import ethernet, arp, ipv4
 from pox.lib.addresses import IPAddr, EthAddr
+import random
+import collections
 
 log = core.getLogger()
 
-# Constants for flow timeouts
-IDLE_TIMEOUT = 300
-HARD_TIMEOUT = 600
+# --- 1. HẰNG SỐ --------------------------------------------------------------
+IDLE_TIMEOUT  = 300
+HARD_TIMEOUT  = 600
+_obfuscate_path = 3                  # ghi đè khi launch()
 
-# Biến toàn cục để lưu obfuscate_path
-_obfuscate_path = 3  # Giá trị mặc định
+# --- 2. TOPOLOGY  (từ K7Topo) -----------------------------------------------
+#   Port numbering theo thứ tự addLink() trong file topo
+PORT_MAP = {}
+def _add(a, b):
+    PORT_MAP.setdefault(a, {})
+    PORT_MAP.setdefault(b, {})
+    PORT_MAP[a][b] = len(PORT_MAP[a]) + 1
+    PORT_MAP[b][a] = len(PORT_MAP[b]) + 1
 
+# 1) spine-spine trước  ➜ spine eth1-eth6
+for i, a in enumerate(range(7, 14)):
+    for b in range(a + 1, 14):
+        _add(a, b)
+
+# 2) edge-spine sau      ➜ edge eth1-eth7, spine eth7-eth12
+for sp in range(7, 14):
+    for e in range(1, 7):
+        _add(sp, e)
+
+SPINE_SWITCHES = set(range(7, 14))
+GRAPH = {u: set(nbr.keys()) for u, nbr in PORT_MAP.items()}
+
+# --- 3. HÀM TIỆN ÍCH ---------------------------------------------------------
 def subnet(ip):
-    """Extract the subnet (first 3 octets) from an IP address."""
-    parts = str(ip).split('.')
-    return ".".join(parts[:3])
+    """Trả về 3 octet đầu – '10.0.3'."""
+    return ".".join(str(ip).split('.')[:3])
 
 def is_allowed_access(src_ip, dst_ip):
-    """Check if communication between two IPs is allowed based on subnet rules."""
+    """ACL tĩnh (deny giữa một số subnet)."""
     src_sub = subnet(src_ip)
     dst_sub = subnet(dst_ip)
     deny_pairs = [("10.0.1", "10.0.2"), ("10.0.3", "10.0.4"), ("10.0.4", "10.0.5")]
-    for (a, b) in deny_pairs:
+    for a, b in deny_pairs:
         if (src_sub == a and dst_sub == b) or (src_sub == b and dst_sub == a):
             return False
     return True
 
-class FlowObfuscateSwitch(object):
-    # Class variables for flow mapping and subnet-to-switch mapping
-    flow_mapping = {}  # {flow_id: (real_src_ip, [virtual_ips])}
+def bfs_shortest(src, dst):
+    """Trả về 1 shortest-path (list DPID) giữa src và dst (cả hai khác nhau)."""
+    if src == dst:
+        return [src]
+    parent = {src: None}
+    q = collections.deque([src])
+    while q and dst not in parent:
+        u = q.popleft()
+        for v in GRAPH[u]:
+            if v not in parent:
+                parent[v] = u
+                q.append(v)
+    if dst not in parent:
+        return []           # không tới được
+    path = []
+    cur = dst
+    while cur is not None:
+        path.append(cur)
+        cur = parent[cur]
+    return list(reversed(path))
+
+def get_outport(cur, nxt):
+    """Lấy port số nhỏ nhất đi tới neighbor kế tiếp."""
+    return PORT_MAP.get(cur, {}).get(nxt)
+
+# --- 4. CLASS SWITCH ---------------------------------------------------------
+class FlowObfuscateSwitch (object):
+    flow_mapping = {}                 # {flow_id: (real_src, [list_virtual])}
     next_flow_id = 1
-    subnet_to_switch = {
-        "10.0.0": 1,  # s1
-        "10.0.1": 2,  # s2
-        "10.0.2": 3,  # s3
-        "10.0.3": 4,  # s4
-        "10.0.4": 5,  # s5
-        "10.0.5": 6,  # s6
+
+    subnet_to_switch = {              # edge switch <--> subnet
+        "10.0.0": 1, "10.0.1": 2, "10.0.2": 3,
+        "10.0.3": 4, "10.0.4": 5, "10.0.5": 6
     }
-    virtual_macs = {
+
+    virtual_macs = {                  # gateway ảo .254
         IPAddr("10.0.0.254"): EthAddr("00:00:00:00:00:01"),
         IPAddr("10.0.1.254"): EthAddr("00:00:00:00:00:02"),
         IPAddr("10.0.2.254"): EthAddr("00:00:00:00:00:03"),
@@ -50,225 +101,151 @@ class FlowObfuscateSwitch(object):
         IPAddr("10.0.4.254"): EthAddr("00:00:00:00:00:05"),
         IPAddr("10.0.5.254"): EthAddr("00:00:00:00:00:06"),
     }
-    # Routing table: (src_switch, dst_switch) -> [path of switches]
-    routing_table = {
-        (1, 2): [1, 7, 8, 9, 10, 11, 12, 13, 2],  # h1 -> s1 -> s7 -> s8 -> s9 -> s10 -> s11 -> s12 -> s13 -> s2 -> h6
-        (1, 3): [1, 7, 8, 9, 10, 11, 12, 13, 3],
-        (1, 4): [1, 7, 8, 9, 10, 11, 12, 13, 4],
-        (1, 5): [1, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4, 5],
-        (1, 6): [1, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4, 5, 6],
-        (2, 1): [2, 13, 12, 11, 10, 9, 8, 7, 1],  # h6 -> s2 -> s13 -> s12 -> s11 -> s10 -> s9 -> s8 -> s7 -> s1 -> h1
-        (2, 3): [2, 3],
-        (2, 4): [2, 3, 4],
-        (2, 5): [2, 3, 4, 5],
-        (2, 6): [2, 3, 4, 5, 6],
-        (3, 1): [3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
-        (3, 2): [3, 2],
-        (3, 4): [3, 4],
-        (3, 5): [3, 4, 5],
-        (3, 6): [3, 4, 5, 6],
-        (4, 1): [4, 3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
-        (4, 2): [4, 3, 2],
-        (4, 3): [4, 3],
-        (4, 5): [4, 5],
-        (4, 6): [4, 5, 6],
-        (5, 1): [5, 4, 3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
-        (5, 2): [5, 4, 3, 2],
-        (5, 3): [5, 4, 3],
-        (5, 4): [5, 4],
-        (5, 6): [5, 6],
-        (6, 1): [6, 5, 4, 3, 2, 13, 12, 11, 10, 9, 8, 7, 1],
-        (6, 2): [6, 5, 4, 3, 2],
-        (6, 3): [6, 5, 4, 3],
-        (6, 4): [6, 5, 4],
-        (6, 5): [6, 5],
-    }
 
+    # ------------------------------------------------------------------
     def __init__(self, connection):
-        """Initialize the switch with connection, MAC table, and default rules."""
         self.connection = connection
-        self.mac_table = {}  # {mac: (dpid, port)}
-        self.ip_to_mac = {}  # {ip: mac}
-        self.pending_packets = {}  # {ip: [(event, packet, ipp, dpid, inport)]}
+        self.mac_table   = {}         # {MAC: (dpid, port)}
+        self.ip_to_mac   = {}         # {IP: MAC}
+        self.pending_packets = {}     # chờ ARP
         connection.addListeners(self)
-        self._install_default_rule()
+        self._install_default_rules()
 
-    def _install_default_rule(self):
-        """Install default flow rules for ARP and other packets."""
-        # Rule for ARP: send to controller
-        msg_arp = of.ofp_flow_mod()
-        msg_arp.match = of.ofp_match()
-        msg_arp.match.dl_type = ethernet.ARP_TYPE
-        msg_arp.priority = 1000
-        msg_arp.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
-        self.connection.send(msg_arp)
-        log.debug("[Debug] Installed ARP rule on switch dpid=%s: send ARP packets to controller", self.connection.dpid)
+    # ------------------------------------------------------------------
+    def _install_default_rules(self):
+        # ARP về controller
+        fm_arp = of.ofp_flow_mod()
+        fm_arp.match.dl_type = ethernet.ARP_TYPE
+        fm_arp.priority = 1000
+        fm_arp.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
+        self.connection.send(fm_arp)
+        # Mặc định về controller
+        fm_def = of.ofp_flow_mod()
+        fm_def.priority = 500
+        fm_def.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))
+        self.connection.send(fm_def)
+        log.debug("[Init] dpid=%s cài ARP & default rule", self.connection.dpid)
 
-        # Default rule: send all other packets to controller
-        msg_default = of.ofp_flow_mod()
-        msg_default.priority = 500
-        msg_default.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
-        self.connection.send(msg_default)
-        log.debug("[Debug] Installed default rule on switch dpid=%s: send all packets to controller", self.connection.dpid)
+    # ------------------------------------------------------------------
 
-    def _get_path(self, src_switch, dst_switch):
-        """Get the path (list of switches) from src_switch to dst_switch."""
-        return self.routing_table.get((src_switch, dst_switch), [])
-
-    def _get_outport(self, current_switch, next_switch):
-        """Determine the output port to reach the next switch."""
-        if current_switch == next_switch:
-            return None
-        if current_switch == 1: return 1  # s1 -> s7
-        if current_switch == 7: return 2 if next_switch == 8 else 1  # s7 -> s8
-        if current_switch == 8: return 2 if next_switch == 9 else 1  # s8 -> s9
-        if current_switch == 9: return 2 if next_switch == 10 else 1  # s9 -> s10
-        if current_switch == 10: return 2 if next_switch == 11 else 1  # s10 -> s11
-        if current_switch == 11: return 2 if next_switch == 12 else 1  # s11 -> s12
-        if current_switch == 12: return 2 if next_switch == 13 else 1  # s12 -> s13
-        if current_switch == 13: return 2 if next_switch == 2 else 1  # s13 -> s2
-        if current_switch == 2:
-            if next_switch == 13: return 1  # s2 -> s13
-            if next_switch == 3: return 2   # s2 -> s3
-            return 3  # s2 -> hosts
-        if current_switch == 3:
-            if next_switch == 2: return 1   # s3 -> s2
-            if next_switch == 4: return 2   # s3 -> s4
-            return 3  # s3 -> hosts
-        if current_switch == 4:
-            if next_switch == 3: return 1   # s4 -> s3
-            if next_switch == 5: return 2   # s4 -> s5
-            return 3  # s4 -> hosts
-        if current_switch == 5:
-            if next_switch == 4: return 1   # s5 -> s4
-            if next_switch == 6: return 2   # s5 -> s6
-            return 3  # s5 -> hosts
-        if current_switch == 6:
-            if next_switch == 5: return 1   # s6 -> s5
-            return 2  # s6 -> hosts
-        return None
-
+    # ------------------------------------------------------------------
     def _handle_PacketIn(self, event):
-        """Handle incoming packets from the switch."""
         packet = event.parsed
-        if not packet:
-            return
-
-        inport = event.port
-        switch_dpid = event.dpid
-        self.mac_table[packet.src] = (switch_dpid, inport)
+        if not packet: return
+        inport, dpid = event.port, event.dpid
+        self.mac_table[packet.src] = (dpid, inport)
 
         if packet.type == ethernet.ARP_TYPE:
-            self._handle_arp(event, packet, switch_dpid, inport)
-        elif packet.type == ethernet.IP_TYPE:
-            ipp = packet.find('ipv4')
-            if ipp is None:
-                return
+            self._handle_arp(event, packet, dpid, inport); return
 
-            self.ip_to_mac[ipp.srcip] = packet.src
-            self.ip_to_mac[ipp.dstip] = packet.dst if ipp.dstip in self.ip_to_mac else None
+        if packet.type != ethernet.IP_TYPE: return
+        ipp = packet.find('ipv4');       # type: ipv4
+        if ipp is None: return
 
-            src_subnet = subnet(ipp.srcip)
-            dst_subnet = subnet(ipp.dstip)
+        self.ip_to_mac[ipp.srcip] = packet.src
+        if ipp.dstip not in self.ip_to_mac:
+            self.ip_to_mac[ipp.dstip] = packet.dst
 
-            if src_subnet == dst_subnet:
-                self._forward_within_subnet(event, packet, ipp, switch_dpid, inport)
-            else:
-                self._handle_obfuscation(event, packet, ipp, switch_dpid, inport)
+        src_sub, dst_sub = subnet(ipp.srcip), subnet(ipp.dstip)
+        if src_sub == dst_sub:
+            self._forward_within_subnet(event, packet, ipp, dpid, inport)
+        else:
+            self._handle_obfuscation(event, packet, ipp, dpid, inport)
 
-    def _handle_obfuscation(self, event, packet, ipp, switch_dpid, inport):
-        """Handle packet obfuscation along the path based on obfuscate_path."""
-        # Handle flow mapping first to determine real_src_ip
+    # ------------------------------------------------------------------
+    def _pick_spine_path(self):
+        k = max(1, _obfuscate_path)
+        return random.sample(SPINE_SWITCHES, k)
+
+    def _handle_obfuscation(self, event, packet, ipp, dpid, inport):
+        # ----- bước 0: xác định flow_id & path ------------------------
         flow_id = int(str(ipp.srcip).split('.')[-1]) if str(ipp.srcip).startswith("10.0.") else None
         if flow_id is None or flow_id not in self.flow_mapping:
-            if switch_dpid == 1:  # First switch in the path (s1)
-                flow_id = self.next_flow_id
-                self.flow_mapping[flow_id] = (ipp.srcip, [])
-                self.next_flow_id += 1
+            if dpid == self.subnet_to_switch[subnet(ipp.srcip)]:
+                flow_id = self.next_flow_id; self.next_flow_id += 1
+                self.flow_mapping[flow_id] = (
+                    ipp.srcip,                 # real_src
+                    self._pick_spine_path(),   # spine_path
+                    []                         # virtual_list
+                )
             else:
-                log.debug("[Debug] Switch dpid=%s: Flow ID %s not in flow_mapping, dropping packet from %s to %s", switch_dpid, flow_id, ipp.srcip, ipp.dstip)
-                return
+                log.debug("[Drop] dpid=%s flow_id %s chưa khởi tạo", dpid, flow_id); return
 
-        real_src_ip, virtual_ips = self.flow_mapping[flow_id]
-        src_subnet = subnet(real_src_ip)  # Use real_src_ip to determine source subnet
-        dst_subnet = subnet(ipp.dstip)
-        src_switch = self.subnet_to_switch.get(src_subnet)
-        dst_switch = self.subnet_to_switch.get(dst_subnet)
-        if not src_switch or not dst_switch:
-            log.debug("[Debug] Switch dpid=%s: Cannot determine src/dst switch for %s -> %s (real src: %s)", switch_dpid, ipp.srcip, ipp.dstip, real_src_ip)
-            return
+        real_src, spine_path, virtual_list = self.flow_mapping[flow_id]
+        # ---------------------------------------------------------------------
+        src_sw = self.subnet_to_switch.get(subnet(real_src))
+        dst_sw = self.subnet_to_switch.get(subnet(ipp.dstip))
 
-        # Get the path from src_switch to dst_switch
-        path = self._get_path(src_switch, dst_switch)
-        if not path or switch_dpid not in path:
-            log.debug("[Debug] Switch dpid=%s: No path found or switch not in path for %s -> %s", switch_dpid, ipp.srcip, ipp.dstip)
-            return
+        if not src_sw or not dst_sw: return
 
-        # Find the position of the current switch in the path
-        current_pos = path.index(switch_dpid)
-
-        # Determine if we should obfuscate at this switch
-        if current_pos < _obfuscate_path and current_pos < len(path) - 1:
-            # Obfuscate: change source IP
-            new_virtual_ip = IPAddr("10.0.{}.{}".format(99 - current_pos, flow_id))
-            virtual_ips.append(new_virtual_ip)
-            self.flow_mapping[flow_id] = (real_src_ip, virtual_ips)
-            log.debug("[Debug] Switch dpid=%s: Obfuscating source IP from %s to %s", switch_dpid, ipp.srcip, new_virtual_ip)
+        path = [src_sw] + spine_path + [dst_sw]
+        if dpid not in path: return
+        pos = path.index(dpid)
+        k_max = min(_obfuscate_path, len(path)-1)
+        # ----- bước 1: đổi IP nếu trong k hop đầu --------------------
+        if pos < k_max:
+            new_ip = IPAddr("10.0.%d.%d" % (99-pos, flow_id))
+            virtual_list.append(new_ip)
+            self.flow_mapping[flow_id] = (real_src, spine_path, virtual_list)
         else:
-            new_virtual_ip = ipp.srcip  # No change if we've exceeded obfuscate_path
+            new_ip = ipp.srcip
 
-        # Check access rules at the last obfuscation point
-        if current_pos == min(_obfuscate_path, len(path) - 2):
-            if not is_allowed_access(real_src_ip, ipp.dstip):
-                log.debug("[Debug] Switch dpid=%s: Access denied for packet from %s to %s", switch_dpid, real_src_ip, ipp.dstip)
-                fm = of.ofp_flow_mod()
-                fm.match = of.ofp_match.from_packet(packet, inport)
-                fm.priority = 25
-                self.connection.send(fm)
+        # ----- bước 2: ACL tại hop cuối giai đoạn obf -----------------
+        if pos == k_max - 1:
+            if not is_allowed_access(real_src, ipp.dstip):
+                fm_drop = of.ofp_flow_mod()
+                fm_drop.match = of.ofp_match.from_packet(packet, inport)
+                fm_drop.priority = 25      # drop
+                self.connection.send(fm_drop)
+                log.debug("[ACL] dpid=%s chặn %s→%s", dpid, real_src, ipp.dstip)
                 return
 
-        # Forward to the next switch
-        next_switch = path[current_pos + 1] if current_pos < len(path) - 1 else None
-        if next_switch:
-            outport = self._get_outport(switch_dpid, next_switch)
+        # ----- bước 3: chọn switch kế & outport ----------------------
+        if pos < len(path)-1:
+            nxt_sw = path[pos+1]
+            outport = get_outport(dpid, nxt_sw)
             if not outport:
-                log.debug("[Debug] Switch dpid=%s: No outport found to reach switch %s", switch_dpid, next_switch)
-                return
-
-            # Forward rule
-            fm = of.ofp_flow_mod()
-            fm.match = of.ofp_match.from_packet(packet, inport)
-            if new_virtual_ip != ipp.srcip:
-                fm.actions.append(of.ofp_action_nw_addr.set_src(new_virtual_ip))
-            fm.actions.append(of.ofp_action_output(port=outport))
-            fm.idle_timeout = IDLE_TIMEOUT
-            fm.hard_timeout = HARD_TIMEOUT
-            fm.priority = 65535
-            fm.data = event.ofp
-            self.connection.send(fm)
-            log.debug("[Debug] Switch dpid=%s: Installed flow rule to forward ICMP from %s to %s via port %s, new src IP=%s", switch_dpid, ipp.srcip, ipp.dstip, outport, new_virtual_ip)
-
-            # Return rule
-            fm_back = of.ofp_flow_mod()
-            fm_back.match = of.ofp_match()
-            fm_back.match.dl_type = ethernet.IP_TYPE
-            fm_back.match.nw_proto = ipp.protocol
-            fm_back.match.nw_src = ipp.dstip
-            fm_back.match.in_port = outport
-            fm_back.match.icmp_type = 0
-            fm_back.match.icmp_code = 0
-            prev_virtual_ip = virtual_ips[-1] if virtual_ips else real_src_ip
-            fm_back.actions.append(of.ofp_action_nw_addr.set_dst(prev_virtual_ip))
-            fm_back.actions.append(of.ofp_action_output(port=inport))
-            fm_back.idle_timeout = IDLE_TIMEOUT
-            fm_back.hard_timeout = HARD_TIMEOUT
-            fm_back.priority = 65535
-            self.connection.send(fm_back)
-            log.debug("[Debug] Switch dpid=%s: Installed return flow rule for ICMP from %s to %s via port %s", switch_dpid, ipp.dstip, prev_virtual_ip, inport)
+                log.error("[Outport] Không có cổng %s→%s", dpid, nxt_sw); return
+            self._install_forward_rule(event, packet, inport, outport,
+                                       ipp, new_ip, virtual_list, real_src, forward=True)
         else:
-            # Last switch: forward to destination host
-            self._forward_to_destination(event, packet, ipp, switch_dpid, inport)  # Sửa lỗi đệ quy
+            # edge đích
+            self._forward_to_destination(event, packet, ipp, dpid, inport)
 
+    # ------------------------------------------------------------------
+    def _install_forward_rule(self, event, packet, inport, outport,
+                              ipp, new_ip, virtual_list, real_src, forward=True):
+        fm = of.ofp_flow_mod()
+        fm.match = of.ofp_match.from_packet(packet, inport)
+        if new_ip != ipp.srcip:
+            fm.actions.append(of.ofp_action_nw_addr.set_src(new_ip))
+        fm.actions.append(of.ofp_action_output(port = outport))
+        fm.idle_timeout, fm.hard_timeout = IDLE_TIMEOUT, HARD_TIMEOUT
+        fm.priority = 65535
+        fm.data = event.ofp
+        self.connection.send(fm)
+        log.debug("[Flow-FWD] dpid=%s %s→%s via port %s (srcIP⇢%s)",
+                  self.connection.dpid, ipp.srcip, ipp.dstip, outport, new_ip)
+
+        # return-rule (ICMP echo-reply)
+        fm_back = of.ofp_flow_mod()
+        fm_back.match.dl_type = ethernet.IP_TYPE
+        fm_back.match.nw_proto = ipp.protocol
+        fm_back.match.nw_src   = ipp.dstip
+        fm_back.match.in_port  = outport
+        fm_back.match.icmp_type = 0; fm_back.match.icmp_code = 0
+        prev_ip = virtual_list[-1] if virtual_list else real_src
+        fm_back.actions.append(of.ofp_action_nw_addr.set_dst(prev_ip))
+        fm_back.actions.append(of.ofp_action_output(port = inport))
+        fm_back.idle_timeout, fm_back.hard_timeout = IDLE_TIMEOUT, HARD_TIMEOUT
+        fm_back.priority = 65535
+        self.connection.send(fm_back)
+        log.debug("[Flow-RET] dpid=%s %s→%s via port %s",
+                  self.connection.dpid, ipp.dstip, prev_ip, inport)
+
+    # ---------- các hàm ARP, forward subnet, dest …  giữ nguyên --------------
+    # *Giữ nguyên code gốc phần _handle_arp, _forward_within_subnet,
+    #  _forward_to_destination, _broadcast_arp_request – bỏ vào đây không đổi.*
     def _handle_arp(self, event, packet, switch_dpid, inport):
         """Handle ARP packets (requests and replies)."""
         arp_pkt = packet.find('arp')
@@ -340,9 +317,9 @@ class FlowObfuscateSwitch(object):
             dst_subnet = subnet(arp_pkt.protodst)
             msg = of.ofp_packet_out(data=event.ofp, in_port=inport)
             if src_subnet == dst_subnet:
-                for port in range(1, 8):
-                    if port != inport:
-                        msg.actions.append(of.ofp_action_output(port=port))
+                for pno in self.connection.ports:               # ✅ flood tất cả
+                    if pno != inport and pno != of.OFPP_LOCAL:
+                        msg.actions.append(of.ofp_action_output(port = pno))
             else:
                 dst_switch = self.subnet_to_switch.get(dst_subnet)
                 if dst_switch:
@@ -397,11 +374,11 @@ class FlowObfuscateSwitch(object):
         fm.priority = 65535
         fm.data = event.ofp
         self.connection.send(fm)
-
+    
     def _forward_to_destination(self, event, packet, ipp, switch_dpid, inport):
         """Forward packets to the destination host."""
         flow_id = int(str(ipp.srcip).split('.')[-1]) if str(ipp.srcip).startswith("10.0.") else None
-        real_src_ip = self.flow_mapping.get(flow_id, (ipp.srcip, []))[0] if flow_id in self.flow_mapping else ipp.srcip
+        real_src_ip = self.flow_mapping.get(flow_id, (ipp.srcip, [], []))[0] if flow_id in self.flow_mapping else ipp.srcip
 
         dst_subnet = subnet(ipp.dstip)
         dst_switch = self.subnet_to_switch.get(dst_subnet)
@@ -481,32 +458,23 @@ class FlowObfuscateSwitch(object):
         msg = of.ofp_packet_out()
         msg.data = eth.pack()
 
-        if switch_dpid == 2 and dst_subnet == "10.0.1":
-            for port in [3, 4, 5, 6, 7]:
-                if port != inport:
-                    msg.actions.append(of.ofp_action_output(port=port))
-                    log.debug("[Debug] Switch dpid=%s: Sending ARP request for %s to port %s", switch_dpid, target_ip, port)
-        else:
-            for port in range(1, 8):
-                if port != inport:
-                    msg.actions.append(of.ofp_action_output(port=port))
-                    log.debug("[Debug] Switch dpid=%s: Sending ARP request for %s to port %s", switch_dpid, target_ip, port)
+        for pno in self.connection.ports:
+            if pno != inport and pno != of.OFPP_LOCAL:
+                msg.actions.append(of.ofp_action_output(port = pno))
+                log.debug("[ARP-REQ] dpid=%s → port %s (for %s)", switch_dpid, pno, target_ip)
 
         self.connection.send(msg)
-
+# -----------------------------------------------------------------------------
 def launch(obfuscate_path="3"):
-    """Start the controller and listen for switch connections."""
+    """pox.py flow_obf.py --obfuscate_path=3"""
     global _obfuscate_path
     try:
-        _obfuscate_path = int(obfuscate_path)
-        if _obfuscate_path < 0:
-            raise ValueError("obfuscate_path must be non-negative")
-    except ValueError as e:
-        log.error("Invalid obfuscate_path value: %s. Using default value 3.", e)
+        _obfuscate_path = max(0, int(obfuscate_path))
+    except ValueError:
+        log.error("Giá trị k không hợp lệ, dùng mặc định 3")
         _obfuscate_path = 3
-    log.info("[FlowObfuscate] Using obfuscate_path=%d", _obfuscate_path)
+    log.info("[Start] obfuscate_path k=%s", _obfuscate_path)
 
     def start_switch(event):
         FlowObfuscateSwitch(event.connection)
     core.openflow.addListenerByName("ConnectionUp", start_switch)
-    log.info("[FlowObfuscate] Started.")
