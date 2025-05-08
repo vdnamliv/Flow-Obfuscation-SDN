@@ -1,54 +1,38 @@
+# -*- coding: utf-8 -*-
+"""
+Clos 2-tier topo với 6 edge switch và 3 spine switch, delay mặc định 5ms/link
+"""
+
 from mininet.topo import Topo
+from mininet.link import TCLink
+from functools import partial
 
 class K7Topo(Topo):
-    def build(self):
-        # Switches
-        s1 = self.addSwitch('s1')  # Subnet 10.0.0.0/24 (h1-h5)
-        s2 = self.addSwitch('s2')  # Subnet 10.0.1.0/24 (h6-h10)
-        s3 = self.addSwitch('s3')  # Subnet 10.0.2.0/24 (h11-h15)
-        s4 = self.addSwitch('s4')  # Subnet 10.0.3.0/24 (h16-h20)
-        s5 = self.addSwitch('s5')  # Subnet 10.0.4.0/24 (h21-h25)
-        s6 = self.addSwitch('s6')  # Subnet 10.0.5.0/24 (h26-h30)
-        s7 = self.addSwitch('s7')  # Obfuscation path
-        s8 = self.addSwitch('s8')  # Obfuscation path
-        s9 = self.addSwitch('s9')  # Obfuscation path
-        s10 = self.addSwitch('s10')  # Obfuscation path
-        s11 = self.addSwitch('s11')  # Obfuscation path
-        s12 = self.addSwitch('s12')  # Obfuscation path
-        s13 = self.addSwitch('s13')  # Obfuscation path
+    def build(self, delay='5ms'):
+        link = partial(self.addLink, cls=TCLink, delay=delay, bw=100)
 
-        # Kết nối các switch
-        self.addLink(s1, s7)
-        self.addLink(s7, s8)
-        self.addLink(s8, s9)
-        self.addLink(s9, s10)
-        self.addLink(s10, s11)
-        self.addLink(s11, s12)
-        self.addLink(s12, s13)
-        self.addLink(s13, s2)
-        self.addLink(s2, s3)
-        self.addLink(s3, s4)
-        self.addLink(s4, s5)
-        self.addLink(s5, s6)
+        # ---------- switches ----------
+        edges  = [self.addSwitch(f's{i}') for i in range(1, 7)]   # s1..s6
+        spines = [self.addSwitch(f's{i}') for i in range(7, 14)]  # s7..s13
 
-        # Hosts
-        for i in range(1, 6):
-            h = self.addHost(f'h{i}', ip=f'10.0.0.{i}/24', defaultRoute='via 10.0.0.254')
-            self.addLink(h, s1)
-        for i in range(6, 11):
-            h = self.addHost(f'h{i}', ip=f'10.0.1.{i-5}/24', defaultRoute='via 10.0.1.254')
-            self.addLink(h, s2)
-        for i in range(11, 16):
-            h = self.addHost(f'h{i}', ip=f'10.0.2.{i-10}/24', defaultRoute='via 10.0.2.254')
-            self.addLink(h, s3)
-        for i in range(16, 21):
-            h = self.addHost(f'h{i}', ip=f'10.0.3.{i-15}/24', defaultRoute='via 10.0.3.254')
-            self.addLink(h, s4)
-        for i in range(21, 26):
-            h = self.addHost(f'h{i}', ip=f'10.0.4.{i-20}/24', defaultRoute='via 10.0.4.254')
-            self.addLink(h, s5)
-        for i in range(26, 31):
-            h = self.addHost(f'h{i}', ip=f'10.0.5.{i-25}/24', defaultRoute='via 10.0.5.254')
-            self.addLink(h, s6)
+        # ---------- 1. full-mesh spine-spine ----------
+        for i, a in enumerate(spines):
+            for b in spines[i+1:]:
+                link(a, b)          # tạo 21 link, chiếm eth1-eth6 trên spine
 
-topos = { 'k7topo': (lambda: K7Topo()) }
+        # ---------- 2. edge-spine uplink ----------
+        for e in edges:             # s1..s6
+            for sp in spines:       # s7..s13
+                link(e, sp)         # sX-eth1..eth7  |  spine eth7..eth12
+
+        # ---------- 3. hosts ----------
+        host_id = 1
+        for subnet, edge in enumerate(edges):    # 0..5
+            for n in range(1, 6):                # h1-h5 mỗi edge
+                h = self.addHost(f'h{host_id}',
+                                 ip=f'10.0.{subnet}.{n}/24',
+                                 defaultRoute=f'via 10.0.{subnet}.254')
+                link(h, edge)
+                host_id += 1
+
+topos = {'k7topo': lambda: K7Topo()}
