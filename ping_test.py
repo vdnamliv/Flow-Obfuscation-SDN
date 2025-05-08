@@ -32,8 +32,9 @@ def main():
     dump_file = "/tmp/tcpdump_%d.txt" % pid
 
     # 1) Chạy tcpdump
+    iface = sorted(i for i in os.listdir('/sys/class/net') if i != 'lo')[0]
     tcpdump_cmd = [
-        "tcpdump", "-i", "h1-eth0",
+        "tcpdump", "-i", iface,
         "icmp and host %s" % dest_ip,
         "-n", "-tt",
         "-l"
